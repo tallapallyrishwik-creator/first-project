@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mindful Connect</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+            color: #1f2937;
+        }
+
+        .mood-icon {
+            font-size: 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 3rem;
+            height: 3rem;
+            border-radius: 50%;
+            color: white;
+        }
+
+        .positive { background-color: #34d399; }
+        .neutral { background-color: #60a5fa; }
+        .negative { background-color: #fca5a5; }
+
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .modal-content {
+            background-color: white;
+            padding: 2rem;
+            border-radius: 0.75rem;
+            max-width: 90%;
+            width: 400px;
+            text-align: center;
+        }
+
+        .pulse-animation {
+            animation: pulse-ring 1.2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+        }
+        @keyframes pulse-ring {
+            0% {
+                transform: scale(0.33);
+            }
+            80%, 100% {
+                opacity: 0;
+            }
+        }
+        .pulse-dot {
+            animation: pulse-dot 1.2s cubic-bezier(0.455, 0.03, 0.515, 0.955) -.4s infinite;
+        }
+        @keyframes pulse-dot {
+            0% {
+                transform: scale(0.8);
+            }
+            50% {
+                transform: scale(1);
+            }
+            100% {
+                transform: scale(0.8);
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen p-4 flex flex-col items-center">
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        setLogLevel('debug');
+
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+
+        let lastRecommendation = "";
+
+        const promptInput = document.getElementById('prompt-input');
+        const submitBtn = document.getElementById('submit-btn');
+        const historyList = document.getElementById('history-list');
+        const userIdDisplay = document.getElementById('user-id');
+        const statsDisplay = document.getElementById('stats-display');
+        const recommendationText = document.getElementById('recommendation-text');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        const messageBox = document.getElementById('message-box');
+        const messageBoxText = document.getElementById('message-box-text');
+        const messageBoxButton = document.getElementById('message-box-button');
+
+        const BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=';
+        const apiKey = '';
+
+        const showMessage = (message) => {
+            messageBoxText.textContent = message;
+            messageBox.classList.remove('hidden');
+        };
+
+        const hideMessage = () => {
+            messageBox.classList.add('hidden');
+        };
+
+        messageBoxButton.addEventListener('click', hideMessage);
+
+        const showLoading = (isLoading) => {
+            loadingSpinner.classList.toggle('hidden', !isLoading);
+            submitBtn.disabled = isLoading;
+            submitBtn.classList.toggle('opacity-50', isLoading);
+        };
+
+        const fetchWithBackoff = async (url, options, retries = 3, delay = 1000) => {
+            try {
+                const response = await fetch(url, options);
+                if (!response.ok) {
+                    if (response.status === 429 && retries > 0) {
+                        console.warn(Rate limit exceeded. Retrying in ${delay}ms...);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        return fetchWithBackoff(url, options, retries - 1, delay * 2);
+                    }
+                    throw new Error(HTTP error! status: ${response.status});
+                }
+                return response.json();
+            } catch (error) {
+                if (retries > 0) {
+                    console.warn(Request failed. Retrying in ${delay}ms...);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    return fetchWithBackoff(url, options, retries - 1, delay * 2);
+                }
+                throw error;
+            }
+        };
+
+        // LLM call for sentiment analysis
+        const getSentiment = async (text) => {
+            const systemPrompt = "Analyze the sentiment of the following text and respond with a single word: 'positive', 'neutral', or 'negative'.";
+            const userQuery = Text: ${text};
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+            };
+            try {
+                const response = await fetchWithBackoff(BASE_URL + apiKey, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const sentimentText = response.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!sentimentText) throw new Error("Could not get sentiment from API.");
+                return sentimentText.toLowerCase().trim();
+            } catch (error) {
+                console.error("Error fetching sentiment:", error);
+                showMessage("Failed to analyze sentiment. Please try again.");
+                return 'neutral'; // Default to neutral on failure
+            }
+        };
+
+        // LLM call for personalized recommendation
+        const getRecommendation = async (sentiment) => {
+            const userQuery = "Based on a recent mood that was categorized as " + sentiment + ", provide a short, actionable wellness recommendation. For example, if the mood is 'negative', recommend 'take a 5-minute walk outside' or 'journal your thoughts'. Be concise and encouraging.";
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+            };
+            try {
+                const response = await fetchWithBackoff(BASE_URL + apiKey, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const recommendation = response.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!recommendation) throw new Error("Could not get recommendation from API.");
+                return recommendation;
+            } catch (error) {
+                console.error("Error fetching recommendation:", error);
+                return "Remember to be kind to yourself today."; // Default recommendation
+            }
+        };
+
+        const updateStats = (moods) => {
+            const counts = { positive: 0, neutral: 0, negative: 0 };
+            moods.forEach(mood => {
+                if (counts[mood.sentiment]) {
+                    counts[mood.sentiment]++;
+                }
+            });
+
+            const total = moods.length;
+            statsDisplay.innerHTML = `
+                <div class="p-4 rounded-lg bg-white shadow-md w-full sm:w-1/3 text-center">
+                    <p class="text-2xl font-bold text-green-500">${((counts.positive / total) * 100 || 0).toFixed(0)}%</p>
+                    <p class="text-sm text-gray-500">Positive Moods</p>
+                </div>
+                <div class="p-4 rounded-lg bg-white shadow-md w-full sm:w-1/3 text-center">
+                    <p class="text-2xl font-bold text-blue-500">${((counts.neutral / total) * 100 || 0).toFixed(0)}%</p>
+                    <p class="text-sm text-gray-500">Neutral Moods</p>
+                </div>
+                <div class="p-4 rounded-lg bg-white shadow-md w-full sm:w-1/3 text-center">
+                    <p class="text-2xl font-bold text-red-400">${((counts.negative / total) * 100 || 0).toFixed(0)}%</p>
+                    <p class="text-sm text-gray-500">Negative Moods</p>
+                </div>
+            `;
+            if (lastRecommendation) {
+                recommendationText.textContent = lastRecommendation;
+            } else {
+                recommendationText.textContent = "Start by logging your mood to get your first recommendation!";
+            }
+        };
+
+        const updateHistory = (moods) => {
+            historyList.innerHTML = '';
+            moods.forEach(mood => {
+                const li = document.createElement('li');
+                li.className = 'bg-white p-4 rounded-lg shadow-md flex items-start space-x-4 mb-4';
+                const sentimentClass = mood.sentiment || 'neutral';
+                const sentimentIcon = {
+                    'positive': '<i class="fa-solid fa-face-smile text-green-500"></i>',
+                    'neutral': '<i class="fa-solid fa-face-meh text-blue-500"></i>',
+                    'negative': '<i class="fa-solid fa-face-frown text-red-400"></i>',
+                }[sentimentClass] || '<i class="fa-solid fa-question text-gray-500"></i>';
+
+                const date = mood.timestamp ? new Date(mood.timestamp.toDate()) : new Date();
+                const formattedDate = date.toLocaleDateString();
+
+                li.innerHTML = `
+                    <div class="mood-icon ${sentimentClass}">${sentimentIcon}</div>
+                    <div class="flex-1">
+                        <p class="text-sm text-gray-500">${formattedDate}</p>
+                        <p class="text-gray-800 mt-1">${mood.text}</p>
+                    </div>
+                `;
+                historyList.appendChild(li);
+            });
+        };
+
+        const submitMood = async () => {
+            const moodText = promptInput.value.trim();
+            if (!moodText) {
+                showMessage("Please write something to check in your mood.");
+                return;
+            }
+
+            if (!userId) {
+                showMessage("User not authenticated. Please wait a moment and try again.");
+                return;
+            }
+
+            showLoading(true);
+
+            try {
+                const sentiment = await getSentiment(moodText);
+                lastRecommendation = await getRecommendation(sentiment);
+
+                const moodEntry = {
+                    text: moodText,
+                    sentiment: sentiment,
+                    recommendation: lastRecommendation,
+                    timestamp: serverTimestamp()
+                };
+
+                const userDocRef = doc(db, 'artifacts', appId, 'users', userId);
+                const moodsCollectionRef = collection(userDocRef, 'moods');
+                await addDoc(moodsCollectionRef, moodEntry);
+
+                promptInput.value = '';
+            } catch (error) {
+                console.error("Error submitting mood:", error);
+                showMessage("Failed to submit mood. Please try again.");
+            } finally {
+                showLoading(false);
+            }
+        };
+
+        window.addEventListener('load', () => {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                showMessage("Failed to initialize the application. Please check the console for details.");
+                return;
+            }
+
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    userIdDisplay.textContent = User ID: ${userId};
+                    
+                    const userMoodsRef = collection(doc(db, 'artifacts', appId, 'users', userId), 'moods');
+                    const q = query(userMoodsRef, orderBy('timestamp', 'desc'));
+
+                    onSnapshot(q, (snapshot) => {
+                        const moods = snapshot.docs.map(doc => doc.data());
+                        updateHistory(moods);
+                        updateStats(moods);
+                    }, (error) => {
+                        console.error("Error fetching real-time data:", error);
+                        showMessage("Failed to fetch mood history. Please reload the page.");
+                    });
+                } else {
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Authentication failed:", error);
+                        showMessage("Authentication failed. Please check your network and try again.");
+                    }
+                }
+            });
+
+            submitBtn.addEventListener('click', submitMood);
+        });
+    </script>
+
+    <!-- App UI -->
+    <header class="w-full max-w-2xl bg-white rounded-lg shadow-lg p-6 mb-6">
+        <h1 class="text-3xl font-bold text-gray-800 text-center">Mindful Connect</h1>
+        <p class="text-center text-gray-500 mt-2">Your daily mental wellness companion.</p>
+        <p id="user-id" class="text-xs text-gray-400 text-center mt-2 break-all"></p>
+        <p class="text-xs text-gray-400 text-center mt-2">Your ID is needed for your friends to interact with you in a multi-player app.</p>
+    </header>
+
+    <main class="w-full max-w-2xl flex-grow">
+        
+        <!-- Mood Check-in Section -->
+        <section class="bg-white p-6 rounded-lg shadow-lg mb-6">
+            <h2 class="text-xl font-semibold mb-4">How are you feeling today?</h2>
+            <textarea id="prompt-input" rows="4" class="w-full p-3 rounded-md border border-gray-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-300" placeholder="Write about your day, your thoughts, or your feelings..."></textarea>
+            <button id="submit-btn" class="mt-4 w-full bg-blue-600 text-white font-bold py-3 rounded-lg hover:bg-blue-700 transition-colors duration-300">
+                Check In Mood
+            </button>
+            <div id="loading-spinner" class="hidden mt-4 flex items-center justify-center">
+                <div class="relative w-8 h-8">
+                    <div class="absolute inset-0 border-4 border-gray-300 rounded-full pulse-animation"></div>
+                    <div class="absolute inset-0 flex items-center justify-center">
+                        <div class="w-3 h-3 bg-blue-500 rounded-full pulse-dot"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Insights and Recommendations Section -->
+        <section class="bg-white p-6 rounded-lg shadow-lg mb-6">
+            <h2 class="text-xl font-semibold mb-4">Your Wellness Insights</h2>
+            <div id="stats-display" class="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4 mb-6">
+                <div class="p-4 rounded-lg bg-white shadow-md w-full sm:w-1/3 text-center">
+                    <p class="text-2xl font-bold text-green-500">0%</p>
+                    <p class="text-sm text-gray-500">Positive Moods</p>
+                </div>
+                <div class="p-4 rounded-lg bg-white shadow-md w-full sm:w-1/3 text-center">
+                    <p class="text-2xl font-bold text-blue-500">0%</p>
+                    <p class="text-sm text-gray-500">Neutral Moods</p>
+                </div>
+                <div class="p-4 rounded-lg bg-white shadow-md w-full sm:w-1/3 text-center">
+                    <p class="text-2xl font-bold text-red-400">0%</p>
+                    <p class="text-sm text-gray-500">Negative Moods</p>
+                </div>
+            </div>
+            <div class="p-4 bg-gray-50 rounded-lg">
+                <p class="text-sm font-semibold mb-2">Today's Recommendation:</p>
+                <p id="recommendation-text" class="text-gray-700 italic">Start by logging your mood to get your first recommendation!</p>
+            </div>
+        </section>
+
+        <!-- Mood History Section -->
+        <section class="bg-white p-6 rounded-lg shadow-lg mb-6">
+            <h2 class="text-xl font-semibold mb-4">Your Mood History</h2>
+            <ul id="history-list" class="space-y-4">
+                <li class="bg-gray-50 p-4 rounded-lg text-center text-gray-500 italic">No mood entries yet.</li>
+            </ul>
+        </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="w-full max-w-2xl text-center text-gray-400 text-xs mt-6 mb-4">
+        <p>If you or someone you know is in crisis, please seek professional help. In the US, you can dial or text 988.</p>
+    </footer>
+
+    <!-- Custom Message Box -->
+    <div id="message-box" class="modal-overlay hidden">
+        <div class="modal-content">
+            <p id="message-box-text" class="text-gray-800 text-lg mb-4"></p>
+            <button id="message-box-button" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition-colors duration-300">
+                OK
+            </button>
+        </div>
+    </div>
+
+</body>
+</html>
